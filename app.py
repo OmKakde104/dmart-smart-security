@@ -6,6 +6,7 @@ from pathlib import Path
 
 import av
 import cv2
+import requests
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer
 from ultralytics import YOLO
@@ -34,6 +35,33 @@ RTC_CONFIGURATION = {
 }
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_rtc_configuration(turn_key_id, turn_api_token):
+    """Use TURN relay credentials on hosted deployments when configured."""
+    if not turn_key_id or not turn_api_token:
+        return RTC_CONFIGURATION, False
+    try:
+        response = requests.post(
+            f"https://rtc.live.cloudflare.com/v1/turn/keys/{turn_key_id}/credentials/generate-ice-servers",
+            headers={"Authorization": f"Bearer {turn_api_token}"},
+            json={"ttl": 7200},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return {"iceServers": response.json()["iceServers"]}, True
+    except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+        return RTC_CONFIGURATION, f"TURN setup failed: {exc}"
+
+
+try:
+    turn_key_id = st.secrets.get("CLOUDFLARE_TURN_KEY_ID", "")
+    turn_api_token = st.secrets.get("CLOUDFLARE_TURN_KEY_API_TOKEN", "")
+except Exception:
+    turn_key_id = turn_api_token = ""
+
+RTC_CONFIG, TURN_STATUS = get_rtc_configuration(turn_key_id, turn_api_token)
+
+
 def normalize_item(value):
     value = re.sub(r"\s+", " ", str(value).strip().lower())
     aliases = {
@@ -44,7 +72,15 @@ def normalize_item(value):
         "bag": "handbag",
     }
     value = aliases.get(value, value)
-    return value if value in PRICE_LIST else None
+    if value in PRICE_LIST:
+        return value
+    for product in PRICE_LIST:
+        if product in value:
+            return product
+    for alias, product in aliases.items():
+        if alias in value and product in PRICE_LIST:
+            return product
+    return None
 
 
 def load_model(weights_path):
@@ -91,6 +127,11 @@ class BrowserCameraProcessor:
         self.first_seen = {}
         self.missing = {}
         self.active_alerts = set()
+        self.frames_processed = 0
+        self.last_detection_count = 0
+        self.last_error = None
+        self.last_scan_message = ""
+        self.last_raw_code = ""
 
     def _get_model(self):
         if self.model is None:
@@ -105,6 +146,13 @@ class BrowserCameraProcessor:
                 found.append(value)
         except cv2.error:
             pass
+        if not found:
+            try:
+                ok, values, _, _ = self.qr_detector.detectAndDecodeMulti(image)
+                if ok and values is not None:
+                    found.extend(value for value in values if value)
+            except (cv2.error, AttributeError, TypeError):
+                pass
         if self.barcode_detector is not None:
             try:
                 result = self.barcode_detector.detectAndDecode(image)
@@ -119,15 +167,19 @@ class BrowserCameraProcessor:
 
     def _process_billing(self, image):
         self.frame_number += 1
-        if self.frame_number % 5 == 0:
+        if self.frame_number % 2 == 0:
             codes = self._scan_codes(image)
             if codes:
                 self.no_code_frames = 0
                 if not self.code_latched:
                     raw_value = codes[0].strip()
                     item = normalize_item(raw_value)
+                    self.last_raw_code = raw_value[:100]
                     if self.scan_queue is not None:
                         self.scan_queue.put((raw_value, item))
+                    self.last_scan_message = (
+                        f"Scanned {item}" if item else "Unrecognized code"
+                    )
                     self.code_latched = True
             else:
                 self.no_code_frames += 1
@@ -138,6 +190,17 @@ class BrowserCameraProcessor:
         x1, y1 = int(width * 0.15), int(height * 0.15)
         x2, y2 = int(width * 0.85), int(height * 0.85)
         cv2.rectangle(image, (x1, y1), (x2, y2), (255, 255, 0), 2)
+        if self.last_scan_message:
+            cv2.putText(
+                image,
+                self.last_scan_message.upper(),
+                (12, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0) if self.last_scan_message.startswith("Scanned") else (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
         cv2.putText(
             image,
             "PLACE BARCODE OR QR HERE",
@@ -156,18 +219,31 @@ class BrowserCameraProcessor:
         if self.frame_number % 4 != 0 and self.last_output is not None:
             return self.last_output.copy()
 
-        model = self._get_model()
         try:
+            model = self._get_model()
             with MODEL_LOCK:
                 results = model.predict(
                     image,
                     imgsz=320,
-                    conf=0.40,
+                    conf=0.25,
                     max_det=30,
                     verbose=False,
                     device="cpu",
                 )
+
+            people, objects = [], []
+            for result in results:
+                for box in result.boxes:
+                    label = str(model.names[int(box.cls.item())]).lower()
+                    coords = box.xyxy[0].cpu().numpy().astype(int)
+                    if label == "person":
+                        people.append(coords)
+                    else:
+                        objects.append((label, coords))
+            self.last_detection_count = len(people) + len(objects)
+            self.last_error = None
         except Exception as exc:
+            self.last_error = str(exc)
             cv2.putText(
                 image,
                 f"Detection error: {str(exc)[:90]}",
@@ -179,16 +255,6 @@ class BrowserCameraProcessor:
                 cv2.LINE_AA,
             )
             return image
-
-        people, objects = [], []
-        for result in results:
-            for box in result.boxes:
-                label = str(model.names[int(box.cls.item())]).lower()
-                coords = box.xyxy[0].cpu().numpy().astype(int)
-                if label == "person":
-                    people.append(coords)
-                else:
-                    objects.append((label, coords))
 
         frame_counts = {}
         visible_objects = []
@@ -247,10 +313,22 @@ class BrowserCameraProcessor:
                 draw_label(image, coords, f"{'PAID' if paid else 'CHECK'} {label.upper()}", color)
         for coords in people:
             draw_label(image, coords, "PERSON", (255, 255, 255))
+        if not people and not objects:
+            cv2.putText(
+                image,
+                "No objects detected - move item closer and improve lighting",
+                (10, image.shape[0] - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
         self.last_output = image.copy()
         return image
 
     def __call__(self, video_frame):
+        self.frames_processed += 1
         image = video_frame.to_ndarray(format="bgr24")
         image = cv2.resize(image, (640, 480))
         if self.mode == "billing":
@@ -310,9 +388,34 @@ with billing_tab:
             key="billing-browser-camera",
             video_frame_callback=billing_processor,
             media_stream_constraints={"video": True, "audio": False},
-            rtc_configuration=RTC_CONFIGURATION,
+            rtc_configuration=RTC_CONFIG,
             async_processing=True,
         )
+
+        @st.fragment(run_every=1.0)
+        def billing_camera_status():
+            if billing_processor.frames_processed == 0:
+                st.warning("Waiting for browser camera frames. Press START and allow camera access.")
+            elif billing_processor.last_scan_message.startswith("Scanned"):
+                st.success(f"Camera active. {billing_processor.last_scan_message}")
+            elif billing_processor.last_scan_message == "Unrecognized code":
+                st.warning(
+                    f"Code read: {billing_processor.last_raw_code!r}. "
+                    "To add it automatically, its QR text must contain a supported "
+                    "product name (for example: bottle, book, phone, backpack). "
+                    "Numeric barcodes need a product-code lookup."
+                )
+            else:
+                st.info("Camera active. Place a clear, well-lit QR code or barcode in the center.")
+            if not TURN_STATUS:
+                st.caption(
+                    "Hosted camera processing may need Cloudflare TURN credentials. "
+                    "Without TURN, the local preview can show while the server receives no frames."
+                )
+            elif isinstance(TURN_STATUS, str):
+                st.warning(TURN_STATUS)
+
+        billing_camera_status()
         st.divider()
         st.subheader("Manual Billing")
         with st.form("manual_billing", clear_on_submit=True):
@@ -380,9 +483,31 @@ with security_tab:
         key="security-browser-camera",
         video_frame_callback=security_processor,
         media_stream_constraints={"video": True, "audio": False},
-        rtc_configuration=RTC_CONFIGURATION,
+        rtc_configuration=RTC_CONFIG,
         async_processing=True,
     )
+    @st.fragment(run_every=1.0)
+    def security_camera_status():
+        if security_processor.frames_processed == 0:
+            st.warning("Waiting for browser camera frames. Press START and allow camera access.")
+            if not TURN_STATUS:
+                st.caption(
+                    "If the camera preview is visible but this message stays here, configure "
+                    "Cloudflare TURN credentials in Streamlit app Secrets."
+                )
+            elif isinstance(TURN_STATUS, str):
+                st.warning(TURN_STATUS)
+        elif security_processor.last_error:
+            st.error(f"Detector error: {security_processor.last_error[:180]}")
+        elif security_processor.last_detection_count:
+            st.success(
+                f"Detection active. Last processed frame contained "
+                f"{security_processor.last_detection_count} object(s)."
+            )
+        else:
+            st.info("Detector is running. Keep a supported object clearly visible in the frame.")
+
+    security_camera_status()
     st.info("AI alerts are suggestions only; verify an event manually.")
 
 with reports_tab:
